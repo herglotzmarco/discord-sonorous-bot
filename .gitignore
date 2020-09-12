@@ -1,0 +1,7 @@
+/target/
+/src/main/resources/web-content/angular/
+
+.classpath
+.project
+.settings
+credentials.properties
