@@ -1,15 +1,18 @@
 package de.herglotz;
 
+import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toUnmodifiableList;
+
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
+import java.util.Random;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 import net.dv8tion.jda.api.entities.Message;
+import net.dv8tion.jda.api.entities.MessageHistory;
 import net.dv8tion.jda.api.entities.MessageHistory.MessageRetrieveAction;
 import net.dv8tion.jda.api.entities.MessageReaction;
 import net.dv8tion.jda.api.entities.MessageReaction.ReactionEmote;
@@ -18,136 +21,133 @@ import net.dv8tion.jda.api.hooks.ListenerAdapter;
 
 public class CommandListener extends ListenerAdapter {
 
-	private Map<String, List<BibleMessage>> messagesByReaction;
+	private static final String INDEX_KEYWORD = "!index";
+	private static final String FETCH_KEYWORD = "!vers";
+
+	private final Map<String, List<BibleMessage>> messagesByReaction;
+	private final Random random;
 
 	public CommandListener() {
-		messagesByReaction = new HashMap<>();
+		this.messagesByReaction = new ConcurrentHashMap<>();
+		this.random = new Random();
 	}
 
 	@Override
 	public void onMessageReceived(MessageReceivedEvent event) {
 		if (shouldReactToMessage(event)) {
-			String msg = event.getMessage().getContentRaw();
-			if (isCommandKeyword(msg)) {
-				if (msg.equals("!index")) {
-					handleIndexEvent(event);
-				} else if (msg.contains("!vers")) {
-					handleFetchEvent(event, msg);
-				}
-				event.getMessage().delete().queueAfter(2, TimeUnit.SECONDS);
+			String msg = event.getMessage().getContentStripped();
+			if (containsCommandKeyword(msg)) {
+				deleteIncomingMessage(event);
+				handleCommand(event, msg);
 			}
 		}
 
 	}
 
-	private void handleIndexEvent(MessageReceivedEvent event) {
-		messagesByReaction.clear();
-		MessageRetrieveAction history = event.getChannel().getHistoryFromBeginning(100);
-		history.queue(h -> {
-			h.getRetrievedHistory().forEach(this::indexQuote);
-			while (h.getRetrievedHistory().size() % 100 == 0) {
-				h.retrieveFuture(100).queue(m -> m.forEach(this::indexQuote));
-				try {
-					Thread.sleep(1000);
-				} catch (InterruptedException e) {
-				}
-			}
-		});
+	private void deleteIncomingMessage(MessageReceivedEvent event) {
+		event.getMessage().delete().queueAfter(2, TimeUnit.SECONDS);
 	}
 
-	private void handleFetchEvent(MessageReceivedEvent event, String msg) {
+	private void handleCommand(MessageReceivedEvent event, String msg) {
+		if (msg.contains(INDEX_KEYWORD)) {
+			handleIndexCommand(event);
+		} else if (msg.contains(FETCH_KEYWORD)) {
+			handleFetchCommand(event, msg);
+		}
+	}
+
+	private void handleIndexCommand(MessageReceivedEvent event) {
+		messagesByReaction.clear();
+		MessageRetrieveAction retrieveAction = event.getChannel().getHistoryFromBeginning(100);
+		retrieveAction.queue(this::indexChannelHistory);
+	}
+
+	private void indexChannelHistory(MessageHistory history) {
+		history.getRetrievedHistory().forEach(this::indexQuote);
+		if (history.getRetrievedHistory().size() % 100 == 0) {
+			history.retrieveFuture(100).queue(messages -> this.indexChannelHistory(history, messages));
+		}
+	}
+
+	// potential StackOverflowException, but for now we will probably never fetch so
+	// many messages that we hit this limit
+	private void indexChannelHistory(MessageHistory history, List<Message> retrieved) {
+		retrieved.forEach(this::indexQuote);
+		if (!retrieved.isEmpty() && history.getRetrievedHistory().size() % 100 == 0) {
+			history.retrieveFuture(100).queue(messages -> this.indexChannelHistory(history, messages));
+		}
+	}
+
+	private void handleFetchCommand(MessageReceivedEvent event, String msg) {
+		List<BibleMessage> messages = selectMessages(msg);
+		sendRandomMessage(event, messages);
+	}
+
+	private List<BibleMessage> selectMessages(String msg) {
 		String[] split = msg.split(" ");
-		List<BibleMessage> messages;
 		if (split.length > 1) {
 			String emote = split[1];
-			messages = messagesByReaction.get(emote);
+			return List.copyOf(messagesByReaction.get(emote));
 		} else {
-			messages = messagesByReaction.values().stream().flatMap(Collection::stream).distinct().collect(Collectors.toList());
+			return messagesByReaction.values().stream()//
+					.flatMap(Collection::stream)//
+					.distinct()//
+					.collect(toUnmodifiableList());
 		}
-		int random = (int) (Math.random() * (messages.size() - 1));
-		event.getChannel().sendMessage(messages.get(random).toString()).queue();
+	}
+
+	private void sendRandomMessage(MessageReceivedEvent event, List<BibleMessage> messages) {
+		int randomIndex = random.nextInt((messages.size() - 1));
+		BibleMessage randomMessage = messages.get(randomIndex);
+		event.getChannel().sendMessage(randomMessage.getAsText()).queue();
 	}
 
 	private void indexQuote(Message message) {
+		String messageContent = message.getContentStripped();
 		if (message.getAuthor().isBot()) {
 			message.delete().queue();
-		} else if (!isCommandKeyword(message.getContentStripped())) {
-			List<String> reactions = message.getReactions().stream()//
-					.map(MessageReaction::getReactionEmote)//
-					.map(ReactionEmote::getAsReactionCode)//
-					.collect(Collectors.toList());
+		} else if (!containsCommandKeyword(messageContent)) {
+			BibleMessage entry = parseMessage(messageContent);
+			indexMessage(message, entry);
+		}
+	}
 
-			String content = message.getContentStripped();
-			String[] lines = content.split("\\n");
-			List<String> authors = new ArrayList<>();
-			List<String> messages = new ArrayList<>();
-			for (int i = 0; i < lines.length; i = i + 2) {
-				if (lines.length == 1) {
-					authors.add("jemand");
-					messages.add(lines[i]);
-				} else {
-					messages.add(lines[i]);
-					authors.add(lines[i + 1].substring(2));
-				}
-			}
-
-			if (reactions.isEmpty()) {
-				messagesByReaction.computeIfAbsent("", r -> new ArrayList<>()).add(new BibleMessage(authors, messages));
-			} else {
-				for (String reaction : reactions) {
-					messagesByReaction.computeIfAbsent(reaction, r -> new ArrayList<>()).add(new BibleMessage(authors, messages));
-				}
+	private void indexMessage(Message message, BibleMessage entry) {
+		List<String> reactions = message.getReactions().stream()//
+				.map(MessageReaction::getReactionEmote)//
+				.map(ReactionEmote::getAsReactionCode)//
+				.collect(toList());
+		if (reactions.isEmpty()) {
+			messagesByReaction.computeIfAbsent("", r -> new ArrayList<>()).add(entry);
+		} else {
+			for (String reaction : reactions) {
+				messagesByReaction.computeIfAbsent(reaction, r -> new ArrayList<>()).add(entry);
 			}
 		}
+	}
+
+	private BibleMessage parseMessage(String messageContent) {
+		String[] lines = messageContent.split("\\n");
+		List<String> authors = new ArrayList<>();
+		List<String> messages = new ArrayList<>();
+		for (int i = 0; i < lines.length; i = i + 2) {
+			if (lines.length == 1) {
+				authors.add("jemand");
+				messages.add(lines[i]);
+			} else {
+				messages.add(lines[i]);
+				authors.add(lines[i + 1].substring(2));
+			}
+		}
+		return new BibleMessage(authors, messages);
 	}
 
 	private boolean shouldReactToMessage(MessageReceivedEvent event) {
 		return event.getChannel().getName().contains("bible") && !event.getAuthor().isBot();
 	}
 
-	private boolean isCommandKeyword(String msg) {
-		return msg.contains("!index") || msg.contains("!vers");
+	private boolean containsCommandKeyword(String msg) {
+		return msg.contains(INDEX_KEYWORD) || msg.contains(FETCH_KEYWORD);
 	}
 
-	private static class BibleMessage {
-
-		private final List<String> authors;
-		private final List<String> messages;
-
-		private BibleMessage(List<String> authors, List<String> messages) {
-			this.authors = authors;
-			this.messages = messages;
-		}
-
-		@Override
-		public int hashCode() {
-			return Objects.hash(authors, messages);
-		}
-
-		@Override
-		public boolean equals(Object obj) {
-			if (this == obj) {
-				return true;
-			}
-			if (obj == null) {
-				return false;
-			}
-			if (getClass() != obj.getClass()) {
-				return false;
-			}
-			BibleMessage other = (BibleMessage) obj;
-			return Objects.equals(authors, other.authors) && Objects.equals(messages, other.messages);
-		}
-
-		@Override
-		public String toString() {
-			String text = "Und " + authors.get(0) + " sprach: " + messages.get(0);
-			for (int i = 1; i < messages.size(); i++) {
-				text = text + ", ";
-				text = text + "und dann sprach " + authors.get(i) + ": " + messages.get(i);
-			}
-			return text;
-		}
-
-	}
 }
