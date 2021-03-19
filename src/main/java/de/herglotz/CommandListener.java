@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import net.dv8tion.jda.api.entities.Message;
 import net.dv8tion.jda.api.entities.MessageHistory;
@@ -23,6 +24,7 @@ public class CommandListener extends ListenerAdapter {
 
 	private static final String INDEX_KEYWORD = "!index";
 	private static final String FETCH_KEYWORD = "!vers";
+	private static final String DELETE_KEYWORD = "!cleanup";
 
 	private final Map<String, List<BibleMessage>> messagesByReaction;
 	private final Random random;
@@ -53,60 +55,20 @@ public class CommandListener extends ListenerAdapter {
 			handleIndexCommand(event);
 		} else if (msg.contains(FETCH_KEYWORD)) {
 			handleFetchCommand(event, msg);
+		} else if (msg.contains(DELETE_KEYWORD)) {
+			handleDeleteCommand(event);
 		}
 	}
 
 	private void handleIndexCommand(MessageReceivedEvent event) {
 		messagesByReaction.clear();
 		MessageRetrieveAction retrieveAction = event.getChannel().getHistoryFromBeginning(100);
-		retrieveAction.queue(this::indexChannelHistory);
-	}
-
-	private void indexChannelHistory(MessageHistory history) {
-		history.getRetrievedHistory().forEach(this::indexQuote);
-		if (history.getRetrievedHistory().size() % 100 == 0) {
-			history.retrieveFuture(100).queue(messages -> this.indexChannelHistory(history, messages));
-		}
-	}
-
-	// potential StackOverflowException, but for now we will probably never fetch so
-	// many messages that we hit this limit
-	private void indexChannelHistory(MessageHistory history, List<Message> retrieved) {
-		retrieved.forEach(this::indexQuote);
-		if (!retrieved.isEmpty() && history.getRetrievedHistory().size() % 100 == 0) {
-			history.retrieveFuture(100).queue(messages -> this.indexChannelHistory(history, messages));
-		}
-	}
-
-	private void handleFetchCommand(MessageReceivedEvent event, String msg) {
-		List<BibleMessage> messages = selectMessages(msg);
-		sendRandomMessage(event, messages);
-	}
-
-	private List<BibleMessage> selectMessages(String msg) {
-		String[] split = msg.split(" ");
-		if (split.length > 1) {
-			String emote = split[1];
-			return List.copyOf(messagesByReaction.get(emote));
-		} else {
-			return messagesByReaction.values().stream()//
-					.flatMap(Collection::stream)//
-					.distinct()//
-					.collect(toUnmodifiableList());
-		}
-	}
-
-	private void sendRandomMessage(MessageReceivedEvent event, List<BibleMessage> messages) {
-		int randomIndex = random.nextInt((messages.size() - 1));
-		BibleMessage randomMessage = messages.get(randomIndex);
-		event.getChannel().sendMessage(randomMessage.getAsText()).queue();
+		retrieveAction.queue(h -> traverseChannelHistory(h, this::indexQuote));
 	}
 
 	private void indexQuote(Message message) {
 		String messageContent = message.getContentStripped();
-		if (message.getAuthor().isBot()) {
-			message.delete().queue();
-		} else if (!containsCommandKeyword(messageContent)) {
+		if (!containsCommandKeyword(messageContent)) {
 			BibleMessage entry = parseMessage(messageContent);
 			indexMessage(message, entry);
 		}
@@ -142,12 +104,65 @@ public class CommandListener extends ListenerAdapter {
 		return new BibleMessage(authors, messages);
 	}
 
+	private void handleFetchCommand(MessageReceivedEvent event, String msg) {
+		List<BibleMessage> messages = selectMessages(msg);
+		sendRandomMessage(event, messages);
+	}
+
+	private List<BibleMessage> selectMessages(String msg) {
+		String[] split = msg.split(" ");
+		if (split.length > 1) {
+			String emote = split[1];
+			return List.copyOf(messagesByReaction.get(emote));
+		} else {
+			return messagesByReaction.values().stream()//
+					.flatMap(Collection::stream)//
+					.distinct()//
+					.collect(toUnmodifiableList());
+		}
+	}
+
+	private void sendRandomMessage(MessageReceivedEvent event, List<BibleMessage> messages) {
+		if (messages.size() == 1) {
+			BibleMessage randomMessage = messages.get(0);
+			event.getChannel().sendMessage(randomMessage.getAsText()).queue();
+		} else if (messages.size() > 1) {
+			int randomIndex = random.nextInt((messages.size() - 1));
+			BibleMessage randomMessage = messages.get(randomIndex);
+			event.getChannel().sendMessage(randomMessage.getAsText()).queue();
+		}
+	}
+
+	private void handleDeleteCommand(MessageReceivedEvent event) {
+		MessageRetrieveAction retrieveAction = event.getChannel().getHistoryFromBeginning(100);
+		retrieveAction.queue(h -> traverseChannelHistory(h, this::deleteBotMessage));
+	}
+
+	private void deleteBotMessage(Message message) {
+		if (message.getAuthor().isBot()) {
+			message.delete().queue();
+		}
+	}
+
+	private void traverseChannelHistory(MessageHistory history, Consumer<Message> action) {
+		traverseChannelHistory(history, history.getRetrievedHistory(), action);
+	}
+
+	// potential StackOverflowException, but for now we will probably never fetch so
+	// many messages that we hit this limit
+	private void traverseChannelHistory(MessageHistory history, List<Message> retrieved, Consumer<Message> action) {
+		retrieved.forEach(action);
+		if (!retrieved.isEmpty() && history.getRetrievedHistory().size() % 100 == 0) {
+			history.retrieveFuture(100).queue(messages -> this.traverseChannelHistory(history, messages, action));
+		}
+	}
+
 	private boolean shouldReactToMessage(MessageReceivedEvent event) {
 		return event.getChannel().getName().contains("bible") && !event.getAuthor().isBot();
 	}
 
 	private boolean containsCommandKeyword(String msg) {
-		return msg.contains(INDEX_KEYWORD) || msg.contains(FETCH_KEYWORD);
+		return msg.contains(INDEX_KEYWORD) || msg.contains(FETCH_KEYWORD) || msg.contains(DELETE_KEYWORD);
 	}
 
 }
